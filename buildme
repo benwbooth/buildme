@@ -1,0 +1,216 @@
+#!/bin/bash
+set -o nounset
+set -o errexit
+set -o pipefail
+
+# acceptable characters in function names: 1a*/~!@#%^*[]{}_-+=:.,?
+# unacceptable characters in function names: <>$`'"&();\|
+
+# set defaults for project variables
+directory=$(pwd)
+basename=$(basename "$directory")
+name=${${basename%%-}:-project}
+if [[ -f VERSION ]]
+then
+  version=$(cat VERSION)
+fi
+version=${version:-${${basename#-}:-1.0.0}}
+
+description='unknown project'
+url=''
+license=()
+depends=()
+update_check='mtime' # valid values: mtime, md5, exists
+
+outputDirectory="${directory}/build"
+sourceDirectory="${directory}/src"
+testDirectory="${directory}/test"
+
+configPath=(/etc/conf.d/buildsh ~/.buildsh)
+pluginPath=(/usr/share/buildsh/plugins ~/.buildsh.d)
+
+# internal variables
+declare -A built
+
+# source all configuration files
+for file in "${configPath[@]}"
+do
+  if [[ -f "$file" ]]
+  then
+    source "$file"
+  fi
+done
+
+# source all found plugins
+for path in "${pluginPath[@]}"
+do
+  if [[ -d "$path" ]]
+  then
+    for file in "$path"/*
+    do
+      source "$file"
+    done
+  fi
+done
+
+# return the body of a defined function. Usage:
+# . <(inline func_name)
+inline () {
+  local fn="$(declare -f "$1")"
+  echo "${fn/#$1 \(\)}"
+}
+
+# to list all defined functions:
+# compgen -A function [pattern]
+
+# rule function for determining sources for the target
+depends () {
+  "depends.$update_check" "$@"
+}
+
+# find the most specific rule that matches the specified target
+buildme.findrule () {
+  # first get the list of rules:
+  mapfile < <(compgen -A function)
+  for rule in "${MAPFILE[@]}"
+  do
+    case rule in
+      *:)
+
+        ;;
+    esac
+  done
+}
+
+buildme.update_check.pre.exists () {
+  [[ -e "$1" ]]
+}
+buildme.update_check.update.exists () {
+  [[ -e "$1" ]]
+}
+
+buildme.update_check.pre.md5 () {
+  [[ "${md5sums["$1"]}" == $("$md5sum" "$1") ]]
+}
+buildme.update_check.update.md5 () {
+  [[ "${md5sums["$1"]}" == $("$md5sum" "$1") ]] && return 1
+  md5sums["$1"]="$("$md5sum" "$1")"
+  return 0
+}
+
+buildme.update_check.pre.mtime () {
+  local prev_max_mtime="${max_mtime:-0}"
+  max_mtime=0
+  return 1
+}
+buildme.update_check.post.mtime () {
+  local target_mtime=$(stat -c %Y "$1")
+  (( max_mtime < target_mtime )) && {
+    max_mtime="$target_mtime"
+    # target doesn't need update
+    return 0
+  }
+  # target needs update
+  return 1
+}
+buildme.update_check.update.mtime () {
+  local updated_target_mtime=$(stat -c %Y "$1")
+  (( updated_target_mtime < max_mtime )) && {
+    # target was not updated
+    return 1
+  }
+  (( max_mtime < prev_max_mtime )) && {
+    max_mtime="$prev_max_mtime"  
+  }
+  # target successfully updated
+  return 0
+}
+
+# Build a target. By this time the target is known--there are no wildcards
+# in the target name.
+buildme.build () {
+  # if this target was already built, return its stored result
+  [[ -n "${built["$*"]}" ]] && return "${built["$*"]}"
+
+  # find the best rule for this target
+  local rule=$(buildme.findrule "$1") 
+
+  # Check if the target needs updating. Some update methods can perform
+  # this check before dependencies are built. Other methods, e.g. mtime
+  # requires the dependencies to be looked up first.
+  declare -F "buildme.update_check.pre.$update_check" >/dev/null &&
+  . <(inline "buildme.update_check.pre.$update_check") && {
+    built["$*"]=0
+    return 0 
+  }
+
+  # Run the rule in a subshell with errexit enabled. This allows
+  # exception-like behavior if any dependency updates fail.
+  # Source the returned build function if it was defined.
+  unset -f build
+  local output=$( 
+    set -e
+    "$rule" "$@" &>/dev/null
+    declare -f build || true
+  )
+  eval "$output"
+  unset -v output
+
+  # Check if the target needs updating. The mtime check happens here.
+  declare -F "buildme.update_check.post.$update_check" >/dev/null &&
+  . <(inline "buildme.update_check.post.$update_check") && {
+    built["$*"]=0
+    return 0 
+  }
+
+  # if a build function was specified
+  [[ -n "$(declare -F build)" ]] && {
+    # execute the build function in a sub-shell
+    ("$build" "$@")
+    # memoize result of building this target
+    built["$*"]="$?"
+
+    unset -f build
+    # update timestamp/checksum for this target
+    declare -F "buildme.update_check.update.$update_check" >/dev/null &&
+    . <(inline "buildme.update_check.update.$update_check")
+  }
+}
+
+# process command-line arguments
+opts=("$@")
+targets=()
+while (( ${#opts[@]} > 0 ))
+do
+  # shift an opt off the opts array
+  opt=${opts[0]}
+  unset opts[0]
+  opts=("${opts[@]}")
+  # process each opt
+  case "$opt" in
+    # process long options
+    --help)
+      ;;
+    # stop parsing options
+    --) targets+=("${opts[@]}"); break ;;
+    --*) echo "unrecognized option: " "$opt"; exit 255;;
+    # convert from short to long form
+    -*)
+      for i in {${#opt}..1}
+      do
+        case ${opt:i:1} in 
+          h) opts=(--help "${opts[@]}") ;;
+          *) echo "unrecognized option: " "-${opt:i:1}"; exit 255;;
+        esac
+      done
+      ;;
+    # collect non-option arguments
+    *) targets+=("$opt") ;;
+  esac
+done
+# process arguments
+for target in "${targets[@]}"
+do
+  buildme.build "$target"
+done
+

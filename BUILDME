@@ -1,0 +1,42 @@
+#!/bin/bash
+set -o errexit
+set -o pipefail
+set -o nounset
+shopt -s extglob
+
+**/*.o: () {
+  depends '**/*.c'
+  build () {
+    "$CC" -o $target -c $source
+  }
+}
+
+.*? () { {
+  local t=1
+  echo "test" 
+  return 1
+} }
+
+inline () {
+  local fn="$(declare -f "$1")"
+  expr match "$fn" "$1"$' () \n{\(.*\)}$'
+}
+
+testfunc () {
+  echo "${t:-}"
+  inline ".*?"
+  . <(inline ".*?") && echo "worked"
+  echo "$t"
+}
+testfunc
+
+# mapfile < <(declare -F)
+# for func in "${MAPFILE[@]/#declare -f }"
+# do
+#   echo $func
+# done
+# for i in {5..1}
+# do
+#   echo $i
+# done
+# 
