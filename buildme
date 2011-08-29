@@ -1,57 +1,20 @@
 #!/bin/bash
-set -o nounset
-set -o errexit
-set -o pipefail
 
 # acceptable characters in function names: 1a*/~!@#%^*[]{}_-+=:.,?
 # unacceptable characters in function names: <>$`'"&();\|
+# to list all defined functions:
+# compgen -A function [pattern]
 
-# set defaults for project variables
-directory=$(pwd)
-basename=$(basename "$directory")
-name=${${basename%%-}:-project}
-if [[ -f VERSION ]]
-then
-  version=$(cat VERSION)
-fi
-version=${version:-${${basename#-}:-1.0.0}}
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s extglob
 
-description='unknown project'
-url=''
-license=()
-depends=()
-update_check='mtime' # valid values: mtime, md5, exists
-
-outputDirectory="${directory}/build"
-sourceDirectory="${directory}/src"
-testDirectory="${directory}/test"
-
-configPath=(/etc/conf.d/buildsh ~/.buildsh)
-pluginPath=(/usr/share/buildsh/plugins ~/.buildsh.d)
-
-# internal variables
-declare -A built
-
-# source all configuration files
-for file in "${configPath[@]}"
-do
-  if [[ -f "$file" ]]
-  then
-    source "$file"
-  fi
-done
-
-# source all found plugins
-for path in "${pluginPath[@]}"
-do
-  if [[ -d "$path" ]]
-  then
-    for file in "$path"/*
-    do
-      source "$file"
-    done
-  fi
-done
+# convert a indexed or associative array value to a properly quoted string
+tostring () {
+  local var="$(declare -p "$1")"
+  eval echo "${var/#declare -? $1=}"
+}
 
 # return the body of a defined function. Usage:
 # . <(inline func_name)
@@ -60,8 +23,42 @@ inline () {
   echo "${fn/#$1 \(\)}"
 }
 
-# to list all defined functions:
-# compgen -A function [pattern]
+# split a string using a delimiter character
+split () {
+  local IFS="$1"
+  set -- $2
+  local array=("$@")
+  tostring array
+}
+
+die () {
+  echo "$@" 1>&2
+  exit 1
+}
+
+warn () {
+  if (( log_level >= 1 )); then
+    echo "$@" 1>&2
+  fi
+}
+
+log () {
+  if (( log_level >= 2 )); then
+    echo "$@" 1>&2
+  fi
+}
+
+info () {
+  if (( log_level >= 3 )); then
+    echo "$@" 1>&2
+  fi
+}
+
+debug () {
+  if (( log_level >= 4 )); then
+    echo "$@" 1>&2
+  fi
+}
 
 # rule function for determining sources for the target
 depends () {
@@ -89,12 +86,14 @@ buildme.update_check.update.exists () {
   [[ -e "$1" ]]
 }
 
-buildme.update_check.pre.md5 () {
-  [[ "${md5sums["$1"]}" == $("$md5sum" "$1") ]]
+buildme.update_check.pre.checksum () {
+  [[ "${checksums["$1"]}" == $("$checksum_prog" "$1") ]]
 }
-buildme.update_check.update.md5 () {
-  [[ "${md5sums["$1"]}" == $("$md5sum" "$1") ]] && return 1
-  md5sums["$1"]="$("$md5sum" "$1")"
+buildme.update_check.update.checksum () {
+  if [[ "${checksums["$1"]}" == $("$checksum_prog" "$1") ]]; then  
+    return 1
+  fi
+  checksums["$1"]="$("$checksum_prog" "$1")"
   return 0
 }
 
@@ -105,23 +104,23 @@ buildme.update_check.pre.mtime () {
 }
 buildme.update_check.post.mtime () {
   local target_mtime=$(stat -c %Y "$1")
-  (( max_mtime < target_mtime )) && {
+  if (( max_mtime < target_mtime )); then
     max_mtime="$target_mtime"
     # target doesn't need update
     return 0
-  }
+  fi
   # target needs update
   return 1
 }
 buildme.update_check.update.mtime () {
   local updated_target_mtime=$(stat -c %Y "$1")
-  (( updated_target_mtime < max_mtime )) && {
+  if (( updated_target_mtime < max_mtime )); then
     # target was not updated
     return 1
-  }
-  (( max_mtime < prev_max_mtime )) && {
+  fi
+  if (( max_mtime < prev_max_mtime )); then
     max_mtime="$prev_max_mtime"  
-  }
+  fi
   # target successfully updated
   return 0
 }
@@ -130,7 +129,9 @@ buildme.update_check.update.mtime () {
 # in the target name.
 buildme.build () {
   # if this target was already built, return its stored result
-  [[ -n "${built["$*"]}" ]] && return "${built["$*"]}"
+  if [[ -n "${built["$*"]}" ]]; then 
+    return "${built["$*"]}"
+  fi
 
   # find the best rule for this target
   local rule=$(buildme.findrule "$1") 
@@ -138,11 +139,11 @@ buildme.build () {
   # Check if the target needs updating. Some update methods can perform
   # this check before dependencies are built. Other methods, e.g. mtime
   # requires the dependencies to be looked up first.
-  declare -F "buildme.update_check.pre.$update_check" >/dev/null &&
-  . <(inline "buildme.update_check.pre.$update_check") && {
+  if [[ -n "$(declare -F "buildme.update_check.pre.$update_check")" 
+      && . <(inline "buildme.update_check.pre.$update_check") ]]; then
     built["$*"]=0
     return 0 
-  }
+  fi
 
   # Run the rule in a subshell with errexit enabled. This allows
   # exception-like behavior if any dependency updates fail.
@@ -157,14 +158,14 @@ buildme.build () {
   unset -v output
 
   # Check if the target needs updating. The mtime check happens here.
-  declare -F "buildme.update_check.post.$update_check" >/dev/null &&
-  . <(inline "buildme.update_check.post.$update_check") && {
+  if [[ -n "$(declare -F "buildme.update_check.post.$update_check")" 
+      && . <(inline "buildme.update_check.post.$update_check") ]]; then
     built["$*"]=0
     return 0 
-  }
+  fi
 
   # if a build function was specified
-  [[ -n "$(declare -F build)" ]] && {
+  if [[ -n "$(declare -F build)" ]]; then
     # execute the build function in a sub-shell
     ("$build" "$@")
     # memoize result of building this target
@@ -172,45 +173,238 @@ buildme.build () {
 
     unset -f build
     # update timestamp/checksum for this target
-    declare -F "buildme.update_check.update.$update_check" >/dev/null &&
-    . <(inline "buildme.update_check.update.$update_check")
-  }
+    if [[ -n "$(declare -F "buildme.update_check.update.$update_check")" ]]; then
+      . <(inline "buildme.update_check.update.$update_check")
+    fi
+  fi
 }
 
-# process command-line arguments
-opts=("$@")
-targets=()
-while (( ${#opts[@]} > 0 ))
-do
-  # shift an opt off the opts array
-  opt=${opts[0]}
-  unset opts[0]
-  opts=("${opts[@]}")
-  # process each opt
-  case "$opt" in
-    # process long options
-    --help)
-      ;;
-    # stop parsing options
-    --) targets+=("${opts[@]}"); break ;;
-    --*) echo "unrecognized option: " "$opt"; exit 255;;
-    # convert from short to long form
-    -*)
-      for i in {${#opt}..1}
-      do
-        case ${opt:i:1} in 
-          h) opts=(--help "${opts[@]}") ;;
-          *) echo "unrecognized option: " "-${opt:i:1}"; exit 255;;
+# take an argument list and an array called optlist of the form:
+#     ( 'a|option-a' "description"
+#       'b|optionb=-' "description"
+#       'c|optionc=a' "description"
+#       'd|optiond=A' "description" )
+# Create and return an associative array called opts, along with the args list
+function getoptions () {
+  local args=("$@")
+  local lookups
+  declare -A lookups
+  declare -A opts
+
+  # build a lookup table for options
+  local i=0 a aliases last
+  while (( i < "${#optlist[@]}" )); do
+    declare -a aliases="$(split '|' "${optlist["$i"]}")"
+    last="${aliases[@]: -1}"
+    for a in "${aliases[@]}"; do
+      lookups["${a%=}"]="$last"
+    done
+    (( i += 2 ))
+  done
+
+  local j lookup optname arg value values convertopts
+  i=0
+  while (( i < "${#args[@]}" )); do
+    arg="${args["$i"]}"
+    # shift an opt off the opts array
+    # process each opt
+    case "${arg}" in
+      -*) # if it's an option, remove it from args list
+        unset args["$i"]
+        args=("${args[@]}")
+        # fall through
+      # stop parsing options if we get a --
+      --) break ;;
+      # process long options
+      --*)
+        arg="${arg#--}" # remove leading dashes
+        lookup="${lookups["${arg%%=}"]}" # lookup this option in the optlist lookup
+        if [[ -n "$lookup" ]]; then
+          optname="${lookup%%=}" #get the optname with any =value removed
+          case "$lookup" in
+            *=*) # parse an option value
+              case "$arg" in
+                *=*) value="${arg#=}" ;;
+                *) value="${args["$i"]}"
+                   unset args["$i"]
+                   args=("${args[@]}")
+              esac
+              # fall through
+            *=-) # string value
+              opts["$optname"]="$value" 
+              ;;
+            *=a) # indexed array
+              unset values
+              declare -a values="${opts["$optname"]}" # string -> array
+              values+=("$value") # append a new value
+              opts["$optname"]="$(tostring values)" # array -> string
+              ;;
+            *=A) # associative array
+              unset values
+              declare -A values="${opts["$optname"]}" # string -> array
+              case "$value" in 
+                *=*) values["${value%%=}"]="${value#=}" ;;
+                *) die "argument not a key-value pair: $value"
+              esac
+              opts["$optname"]="$(tostring values)" # array -> string
+              ;;
+            *) opts["$optname"]="$optname" ;;
+          esac
+        else
+          die "unrecognized option: $opt"
+        fi
+        ;;
+      # convert from short to long form
+      -*)
+        j=1
+        convertopts=()
+        while (( j++ < "${#arg}" )); do
+          lookup="${lookups["${opt:j:1}"]}"
+          if [[ -n "$lookup" ]]; then
+            case "$lookup" in
+              *=*) 
+                if (( j < "${#opt}"-1 )); then 
+                  value="${opt:j+1}"
+                  convertopts+=("--${lookup%%=}" "$value")
+                  break
+                fi
+                # fall through
+              *) convertopts+=("--${lookup%%=}") ;;
+            esac
+          else
+            die "unrecognized option: -${opt:j:1}"
+          fi
+        done
+        # add the converted opts to args
+        args=("${args[@]:0:i}" "${convertopts[@]}" "${args[@]:i}")
+        ;;
+      *) (( i++ )) ;;
+    esac
+  done
+  # print the parsed options and arguments list
+  declare -p args opts
+}
+
+# given a list of options and descriptions optlist, print a usage
+# message displaying the options.
+# The first argument is a message to display before the options list.
+# The second argument is a message to dislay after the options list.
+function usage () {
+  echo "$1"
+  echo "Usage: "
+  local i=0 a aliases desc last optline d
+  while (( i < "${#optlist[@]}" )); do
+    declare -a aliases="$(split '|' "${optlist[@]:i:1}")"
+    declare -a desc="$(split $'\n' "${optlist[@]:i+1:1}")"
+    optline='  '
+    # print the option aliases
+    for a in "${aliases[@]}"; do
+      case "${a%=}" in
+        ??*) optline+="--${a%=} " ;;
+        *) optline+="-${a%=} " ;;
+      esac
+    done
+    # print the option type
+    last="${aliases[@]: -1}"
+    case "$last" in
+      *=*) 
+        case "${last##=}" in 
+          -) optline+=' value';;
+          a) optline+=' value ...' ;;
+          A) optline+=' key=value ...' ;;
         esac
-      done
-      ;;
-    # collect non-option arguments
-    *) targets+=("$opt") ;;
-  esac
-done
-# process arguments
-for target in "${targets[@]}"
+    esac
+    echo "$optline"
+    # print the indented description
+    for d in "${desc[@]}"; do
+      echo "    $d"
+    done
+    echo
+    (( i += 2 ))
+  done
+  echo "$2"
+}
+
+
+# parse command-line options
+optlist=(
+  'h|help' "display a help message."
+  't|test1=-' "test1 message"
+  'r|test2=a' "test2 message"
+  's|test3=A' "test3 message"
+)
+eval "$(getoptions "$@")" # returns opts, args
+
+if [[ -n "${opts["help"]}" ]]; then
+  usage "$0"
+fi
+
+# find the project directory
+pushd
+directory="$(pwd)"
+while [[ ! -f "$directory/BUILDME" ]]; do
+  cd ..
+  directory="$(pwd)"
+  if [[ "$(pwd)" -eq / ]]; then
+    die "Could not find BUILDME project build file in any parent directory"
+    break;
+  fi
+done 
+popd
+
+# set defaults for project variables
+basename=$(basename "$directory")
+name=${${basename%%-}:-project}
+if [[ -f VERSION ]]
+then
+  version=$(cat VERSION)
+fi
+version=${version:-${${basename#-}:-1.0.0}}
+
+description='unknown project'
+url=''
+license=()
+depends=()
+update_check='mtime' # valid values: mtime, checksum, exists
+
+outputDirectory="${directory}/build"
+sourceDirectory="${directory}/src"
+testDirectory="${directory}/test"
+
+configPath=(/etc/conf.d/buildsh ~/.buildsh)
+pluginPath=(/usr/share/buildsh/plugins ~/.buildsh.d)
+
+checksum_prog=md5sum
+declare -A checksums
+
+log_level=2
+
+# internal variables
+declare -A built
+
+# source all configuration files
+for file in "${configPath[@]}"
 do
+  if [[ -f "$file" ]]
+  then
+    source "$file"
+  fi
+done
+
+# source all found plugins
+for path in "${pluginPath[@]}"
+do
+  if [[ -d "$path" ]]
+  then
+    for file in "$path"/*
+    do
+      source "$file"
+    done
+  fi
+done
+
+# process arguments
+for target in "${args[@]}"; do
   buildme.build "$target"
 done
 

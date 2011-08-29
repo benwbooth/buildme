@@ -22,13 +22,28 @@ inline () {
   expr match "$fn" "$1"$' () \n{\(.*\)}$'
 }
 
-testfunc () {
-  echo "${t:-}"
-  inline ".*?"
-  . <(inline ".*?") && echo "worked"
+# convert a indexed or associative array value to a properly quoted string
+tostring () {
+  local var="$(declare -p "$1")"
+  eval echo "${var/#declare -? $1=}"
+}
+
+# split a string using a delimiter character
+split () {
+  local IFS="$1"
+  set -- $2
+  local array=("$@")
+  tostring array
+}
+t='bad'
+function testt() {
+  # declare -[aA] necessary for deserialization
+  local t
+  declare -a t="$(split '|=' '111=222=333|xxx')"
   echo "$t"
 }
-testfunc
+testt
+
 
 # mapfile < <(declare -F)
 # for func in "${MAPFILE[@]/#declare -f }"
